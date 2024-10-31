@@ -16,7 +16,7 @@ from e3nn.nn import FullyConnectedNet, Gate
 from e3nn.o3 import Linear
 
 from _Convolution import Convolution
-from _Self_int import Self_interact
+
 from Besel_basis import BesselBasis
 
 #Finding whether there is the exsisted path in Tensor product of irreducible representation (irreps) 1 and 2 that results in irreps out
