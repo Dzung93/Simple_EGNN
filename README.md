@@ -4,6 +4,8 @@ Needed package:
 
 !pip install torch-geometric
 
+!pip install torch_ema
+
 !pip install ase e3nn scikit-learn
  
 The main Notebook is EGNN.ipynb
