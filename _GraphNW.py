@@ -19,6 +19,7 @@ from _Convolution import Convolution
 from Besel_basis import BesselBasis
 from Data_processing import to_edge
 
+
 #Finding whether there is the exsisted path in Tensor product of irreducible representation (irreps) 1 and 2 that results in irreps out
 def tp_path_exists(irreps_in1, irreps_in2, ir_out):
     irreps_in1 = o3.Irreps(irreps_in1).simplify()
@@ -48,7 +49,7 @@ class CustomCompose(torch.nn.Module):
         return x
 
 class Network(torch.nn.Module):
-    r"""equivariant neural network
+    """equivariant neural network
     Parameters
     ----------
     irreps_in : `e3nn.o3.Irreps` or None
@@ -106,6 +107,8 @@ class Network(torch.nn.Module):
         #self.num_nodes = num_nodes
         #self.reduce_output = reduce_output
 
+        self.basis = BesselBasis(r_max = self.max_radius, num_basis=self.number_of_basis, trainable=True)
+
         self.irreps_in = o3.Irreps(irreps_in) if irreps_in is not None else None
         self.irreps_hidden = o3.Irreps([(self.mul, (l, p)) for l in range(lmax + 1) for p in [-1, 1]])
         self.irreps_out = o3.Irreps(irreps_out)
@@ -114,6 +117,7 @@ class Network(torch.nn.Module):
 
         self.input_has_node_in = (irreps_in is not None)
         self.input_has_node_attr = (irreps_node_attr is not None)
+        self.conv_to_output_hidden_irreps = o3.Irreps([(max(1, self.irreps_in.num_irreps // 2), (0, 1))]) if irreps_in is not None else o3.Irreps("0e")
 
         irreps = self.irreps_in if self.irreps_in is not None else o3.Irreps("0e")
 
@@ -160,37 +164,18 @@ class Network(torch.nn.Module):
         # Output block: output is scalar, so all l>0 will be throwed away in lin2
         self.lin1 = Linear(
             irreps_in= irreps,
-            irreps_out= irreps,
+            irreps_out= self.conv_to_output_hidden_irreps,
             internal_weights=True,
             shared_weights=True,
             )
         
 
         self.lin2 = Linear(
-            irreps_in= irreps,
+            irreps_in= self.conv_to_output_hidden_irreps,
             irreps_out= self.irreps_out,
             internal_weights=True,
             shared_weights=True,
             )       
-
-    def preprocess(self, data: Union[Data, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        if 'batch' in data:
-            batch = data['batch']
-        else:
-            batch = data['pos'].new_zeros(data['pos'].shape[0], dtype=torch.long)
-
-        if 'edge_index' in data:
-            edge_src = data['edge_index'][0]  # edge source
-            edge_dst = data['edge_index'][1]  # edge destination
-            edge_vec = data['edge_vec']
-        
-        else:
-            edge_index = radius_graph(data['pos'], self.max_radius, batch)
-            edge_src = edge_index[0]
-            edge_dst = edge_index[1]
-            edge_vec = data['pos'][edge_src] - data['pos'][edge_dst]
-
-        return batch, edge_src, edge_dst, edge_vec
 
     def forward(self, data: Union[Data, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """evaluate the network
@@ -199,20 +184,31 @@ class Network(torch.nn.Module):
         data : `torch_geometric.data.Data` or dict
             data object containing
             - ``pos`` the position of the nodes (atoms)
-            - ``x`` the input features of the nodes, optional
-            - ``z`` the attributes of the nodes, for instance the atom type, optional
+            - ``node_fea`` the input features of the nodes, optional
+            - ``node_att`` the attributes of the nodes, for instance the atom type, optional
             - ``batch`` the graph to which the node belong, optional
         """
-        batch, edge_src, edge_dst, edge_vec = self.preprocess(data)
+        if 'batch' in data:
+            batch = data['batch']
+        else:
+            batch = data['pos'].new_zeros(data['pos'].shape[0], dtype=torch.long)
+            
+        edge_src = data['edge_index'][0]  # edge source
+        edge_dst = data['edge_index'][1]  # edge destination
+        edge_vec = data['edge_vec']
+        
         edge_attr = o3.spherical_harmonics(self.irreps_edge_attr, edge_vec, True, normalization='component')
         # edge_sh = o3.spherical_harmonics(self.irreps_edge_attr, edge_vec, True, normalization='component')
         edge_length = edge_vec.norm(dim=1)
         
         #Learnable edge length embedded
-        rad_basis = BesselBasis(r_max = self.max_radius, num_basis=self.number_of_basis, trainable=True) 
+        #rad_basis = BesselBasis(r_max = self.max_radius, num_basis=self.number_of_basis, trainable=True) 
+        
         cutoff = PolynomialCutoff(r_max = self.max_radius, p=6)(edge_length).unsqueeze(-1)
-        edge_length_embedded = rad_basis(edge_length) * cutoff
 
+        edge_length_embedded = self.basis(edge_length) * cutoff
+
+        #print(edge_length_embedded.device)
         # embedded edge_length by ase 
         # edge_length_embedded = soft_one_hot_linspace(
         #     x=edge_length,
@@ -225,27 +221,25 @@ class Network(torch.nn.Module):
         
         # edge_attr = smooth_cutoff(edge_length / self.max_radius)[:, None] * edge_sh
 
-        if self.input_has_node_in and 'x' in data:
-            assert self.irreps_in is not None
-            x = data['x']
+        if self.input_has_node_in and 'node_fea' in data:
+            node_fea = data['node_fea']
         else:
-            assert self.irreps_in is None
-            x = data['pos'].new_ones((data['pos'].shape[0], 118))
+            # assert self.irreps_in is None
+            node_fea = data['pos'].new_ones((data['pos'].shape[0], 1))
 
-        if self.input_has_node_attr and 'z' in data:
-            z = data['z']
+        if self.input_has_node_attr and 'node_att' in data:
+            node_att = data['node_att']
         else:
-            #assert self.irreps_node_attr == o3.Irreps("0e")
-            assert self.input_has_node_attr is None
-            z = data['pos'].new_ones((data['pos'].shape[0], 118))
+            # assert self.input_has_node_attr is None
+            node_att = data['pos'].new_ones((data['pos'].shape[0], 1))
 
         for lay in self.layers:
-            x = lay(x, z, edge_src, edge_dst, edge_attr, edge_length_embedded)
+            node_fea = lay(node_fea, node_att, edge_src, edge_dst, edge_attr, edge_length_embedded)
 
-        x = self.lin1(x)
-        x = self.lin2(x)
+        node_fea = self.lin1(node_fea)
+        node_fea = self.lin2(node_fea)
             
-        return x
+        return node_fea
 
 class PeriodicNetwork(Network):
     def __init__(self, in_dim, em_dim, vectorize: bool = False, **kwargs):            
@@ -261,35 +255,9 @@ class PeriodicNetwork(Network):
         self.em = nn.Linear(in_dim, em_dim)
         self.vectorize = vectorize
 
-    # def force(self, data: Union[tg.data.Data, Dict[str, torch.Tensor]]):
-    #     data = data.clone()
-    
-    #     def wrapper(pos: torch.Tensor) -> torch.Tensor:
-    #         #nonlocal data
-    #         lat = data.lattice
-    #         edge_index, edge_shift, edge_vec, edge_len = to_edge(lat=lat, pos=pos, r_max=self.max_radius)
-    #         data.edge_vec = edge_vec
-    #         data.edge_index = edge_index
-    #         data.edge_shift = edge_shift
-    #         data.edge_len = edge_len
-    #         out = super().forward(data)
-    #         return torch.sum(out, dim=0).squeeze(-1)
-        
-    #     pos = data.pos
-    
-    #     f = torch.autograd.functional.jacobian(
-    #         func=wrapper,
-    #         inputs=pos,
-    #         create_graph=self.training,  # needed to allow gradients of this output during training
-    #         vectorize=self.vectorize,
-    #         strict=True
-    #     )
-    #     f = f.negative()
-    #     return f
-
     def forward(self, data: Union[tg.data.Data, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        data.x = F.relu(self.em(data.x))
-        data.z = F.relu(self.em(data.z))
+        #Embedding
+        data.node_fea = F.relu(self.em(data.node_fea))
             
         E_per_atom = super().forward(data)
 
@@ -396,41 +364,3 @@ class PolynomialCutoff(torch.nn.Module):
         """
         return _poly_cutoff(x, self._factor, p=self.p)
 
-# class Force(torch.nn.Module):
-#     vectorize: bool
-#     def __init__(
-#         self,
-#         model,   #energy model
-#         max_radius,
-#         vectorize: bool = False,
-#     ):
-#         super().__init__()
-#         self.model = model
-#         self.max_radius = max_radius
-#         self.vectorize = vectorize
-
-#     def forward(self, data):
-#         data = data.clone()
-    
-#         def wrapper(pos: torch.Tensor) -> torch.Tensor:
-#             #nonlocal data
-#             lat = data.lattice
-#             edge_index, edge_shift, edge_vec, edge_len = to_edge(lat=lat, pos=pos, r_max=max_radius)
-#             data.edge_vec = edge_vec
-#             data.edge_index = edge_index
-#             data.edge_shift = edge_shift
-#             data.edge_len = edge_len
-#             out, _ = model(data)  
-#             return out.squeeze(-1)
-        
-#         pos = data.pos
-    
-#         f = torch.autograd.functional.jacobian(
-#             func=wrapper,
-#             inputs=pos,
-#             create_graph=self.training,  # needed to allow gradients of this output during training
-#             vectorize=self.vectorize,
-#             strict=True
-#         )
-#         f = f.negative()
-#         return f
